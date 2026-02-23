@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List
 
-DB_PATH = Path.home() / "applylog.sqlite3"
+DB_PATH = Path("/Users/Sheldon/Desktop/Career/applylog/applylog.sqlite3")
 
 # If you *really* don't want to store the pasted text, set this to False.
 STORE_RAW_TEXT = True
@@ -32,6 +32,17 @@ STORE_RAW_TEXT = True
 VALID_STATUS = {"sent", "interview", "offer", "rejected", "ghosted", "draft"}
 
 URL_RE = re.compile(r"https?://[^\s)\]}>\"']+", re.IGNORECASE)
+
+# Role like: "IT Systembetreuer (m/w/d)", "Software Engineer (f/m/d)", etc.
+ROLE_MWD_RE = re.compile(
+    r"\b([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9 /\-+,&]{3,100}?)\s*\((?:m|f|w|d|x)\/(?:m|f|w|d|x)\/?(?:d|x)?\)",
+    re.IGNORECASE,
+)
+
+# German postcode + city, e.g. "64295 Darmstadt", "70173 Stuttgart"
+POSTCODE_LOCATION_RE = re.compile(
+    r"\b(\d{5})\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-\s]+)\b"
+)
 
 # Common “label: value” patterns found in job posts
 ROLE_LABEL_PATTERNS = [
@@ -153,19 +164,27 @@ def extract(text: str) -> Extracted:
     urls = URL_RE.findall(text)
     ex.job_url = urls[0] if urls else None
 
-    # Role: from labels
-    ex.role = _first_label_match(ROLE_LABEL_PATTERNS, text)
+    # Role: first try (m/w/d)-style titles
+    m_role = ROLE_MWD_RE.search(text)
+    if m_role:
+        ex.role = m_role.group(1).strip()
+    else:
+        ex.role = _first_label_match(ROLE_LABEL_PATTERNS, text)
 
     # Company: from labels, else legal-name heuristic
     ex.company = _first_label_match(COMPANY_LABEL_PATTERNS, text)
     if not ex.company:
         ex.company = _guess_company_from_legal_name(text)
 
-    # Location: from labels, else hint
-    ex.location = _first_label_match(LOCATION_LABEL_PATTERNS, text)
-    if not ex.location:
-        m = LOCATION_HINT_RE.search(text)
-        ex.location = m.group(0) if m else None
+    # Location: first try postcode + city
+    m_loc = POSTCODE_LOCATION_RE.search(text)
+    if m_loc:
+        ex.location = f"{m_loc.group(1)} {m_loc.group(2).strip()}"
+    else:
+        ex.location = _first_label_match(LOCATION_LABEL_PATTERNS, text)
+        if not ex.location:
+            m = LOCATION_HINT_RE.search(text)
+            ex.location = m.group(0) if m else None
 
     # Clean up company if it looks like “About us”
     if ex.company:
