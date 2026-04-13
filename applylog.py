@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-autolog.py — log job applications from either:
-1) a pasted job-post URL, or
-2) pasted raw job description text
+autolog.py — paste job description -> auto-extract fields -> confirm -> save to SQLite
 
 What it stores:
 - company (required after confirmation)
@@ -28,13 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List
 
-import requests
-from bs4 import BeautifulSoup
-
 DB_PATH = Path("/Users/Sheldon/Desktop/Career/applylog/applylog.sqlite3")
 
 STORE_RAW_TEXT = True
-REQUEST_TIMEOUT = 15
 
 VALID_STATUS = {"sent", "interview", "offer", "rejected", "ghosted", "draft"}
 
@@ -156,37 +150,6 @@ def read_multiline() -> str:
     return "\n".join(lines).strip()
 
 
-def ask_mode() -> str:
-    print("Choose input mode:")
-    print("1) Paste job URL")
-    print("2) Paste raw job description")
-    choice = input("Mode [1]: ").strip()
-    return "url" if choice in {"", "1"} else "text"
-
-
-def fetch_url_text(url: str) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/123.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
-    }
-
-    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-
-    text = soup.get_text(separator="\n")
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
 def _first_label_match(patterns: List[str], text: str) -> Optional[str]:
     for pat in patterns:
         m = re.search(pat, text)
@@ -252,11 +215,11 @@ def _extract_salary(text: str) -> Optional[str]:
     return None
 
 
-def extract(text: str, source_url: Optional[str] = None) -> Extracted:
+def extract(text: str) -> Extracted:
     ex = Extracted(hr_emails=[])
 
     urls = URL_RE.findall(text)
-    ex.job_url = source_url or (urls[0] if urls else None)
+    ex.job_url = urls[0] if urls else None
 
     m_role = ROLE_MWD_RE.search(text)
     if m_role:
@@ -349,33 +312,12 @@ def main() -> None:
 
     print(f"DB: {DB_PATH}\n")
 
-    mode = ask_mode()
+    raw = read_multiline()
+    if not raw:
+        print("No text pasted. Exiting.")
+        return
 
-    raw = ""
-    source_url = None
-
-    if mode == "url":
-        source_url = input("Paste job URL: ").strip()
-        if not source_url:
-            print("No URL provided. Exiting.")
-            return
-
-        try:
-            raw = fetch_url_text(source_url)
-            if not raw:
-                print("Fetched page but no readable text was extracted.")
-                return
-        except requests.RequestException as e:
-            print(f"Could not fetch URL: {e}")
-            print("Tip: some sites block requests. In that case, use paste-text mode.")
-            return
-    else:
-        raw = read_multiline()
-        if not raw:
-            print("No text pasted. Exiting.")
-            return
-
-    ex = extract(raw, source_url=source_url)
+    ex = extract(raw)
 
     print("\nExtracted (edit if needed, press Enter to accept):")
     company = confirm_field("Company", ex.company, required=True)
