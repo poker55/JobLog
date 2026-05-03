@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-autolog.py — paste job description -> auto-extract fields -> confirm -> save to SQLite
+applylog.py — paste job description -> auto-extract fields -> confirm -> save to SQLite
 
 What it stores:
 - company (required after confirmation)
@@ -14,13 +14,15 @@ What it stores:
 - raw_text (optional, configurable)
 
 Usage:
-  python autolog.py
+  python applylog.py
 """
 
 from __future__ import annotations
 
-import re
+import json
 import sqlite3
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,60 +32,10 @@ DB_PATH = Path("/Users/Sheldon/Desktop/Career/applylog/applylog.sqlite3")
 
 STORE_RAW_TEXT = True
 
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:3b"
+
 VALID_STATUS = {"sent", "interview", "offer", "rejected", "ghosted", "draft"}
-
-URL_RE = re.compile(r"https?://[^\s)\]}>\"']+", re.IGNORECASE)
-EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
-
-ROLE_MWD_RE = re.compile(
-    r"\b([A-ZÄÖÜ][A-Za-zÄÖÜäöüß0-9 /\-+,&]{3,100}?)\s*\((?:m|f|w|d|x)\/(?:m|f|w|d|x)\/?(?:d|x)?\)",
-    re.IGNORECASE,
-)
-
-POSTCODE_LOCATION_RE = re.compile(
-    r"\b(\d{5})\s+([A-ZÄÖÜ][A-Za-zÄÖÜäöüß\-\s]+)\b"
-)
-
-ROLE_LABEL_PATTERNS = [
-    r"(?im)^\s*(job title|title|position|role|stellenbezeichnung|stelle|funktion)\s*[:\-]\s*(.+?)\s*$",
-    r"(?im)^\s*(we are looking for|wir suchen)\s*(.+?)\s*$",
-]
-
-COMPANY_LABEL_PATTERNS = [
-    r"(?im)^\s*(company|firma|unternehmen)\s*[:\-]\s*(.+?)\s*$",
-    r"(?im)^\s*about\s+(.+?)\s*$",
-    r"(?im)^\s*über\s+(.+?)\s*$",
-]
-
-LOCATION_LABEL_PATTERNS = [
-    r"(?im)^\s*(location|standort|arbeitsort)\s*[:\-]\s*(.+?)\s*$",
-]
-
-SALARY_LABEL_PATTERNS = [
-    r"(?im)^\s*(salary|gehalt|vergütung|jahresgehalt)\s*[:\-]\s*(.+?)\s*$",
-]
-
-LOCATION_HINT_RE = re.compile(
-    r"\b(Berlin|Hamburg|München|Munich|Frankfurt|Köln|Cologne|Stuttgart|Düsseldorf|Darmstadt|Aachen|Leipzig|Dresden|"
-    r"Remote|Hybrid|Deutschland|Germany|DE)\b",
-    re.IGNORECASE,
-)
-
-LEGAL_SUFFIX_RE = re.compile(
-    r"\b(GmbH|AG|SE|KG|UG|GmbH\s*&\s*Co\.\s*KG|Ltd\.|Limited|Inc\.|Corporation|S\.?r\.?l\.?|S\.?p\.?A\.?)\b",
-    re.IGNORECASE,
-)
-
-SALARY_RE = re.compile(
-    r"(?i)\b("
-    r"(?:€|\$)?\s?\d[\d\.\, ]{2,15}\s?(?:€|\$)?\s*(?:pro\s*(?:jahr|monat|stunde)|per\s*(?:year|month|hour)|/year|/month|/hour)?"
-    r"(?:\s*[-–—]\s*(?:€|\$)?\s?\d[\d\.\, ]{2,15}\s?(?:€|\$)?)?"
-    r")\b"
-)
-
-HR_HINT_RE = re.compile(
-    r"(?i)\b(hr|human resources|recruiting|recruiter|talent|bewerbung|karriere|jobs)\b"
-)
 
 
 @dataclass
@@ -150,103 +102,100 @@ def read_multiline() -> str:
     return "\n".join(lines).strip()
 
 
-def _first_label_match(patterns: List[str], text: str) -> Optional[str]:
-    for pat in patterns:
-        m = re.search(pat, text)
-        if not m:
-            continue
-        val = m.groups()[-1].strip()
-        val = re.sub(r"^[\s:–—\-]+|[\s:–—\-]+$", "", val)
-        if 2 <= len(val) <= 140:
-            return val
-    return None
+def _clean_optional(value) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        value = ", ".join(str(v).strip() for v in value if str(v).strip())
+    value = str(value).strip()
+    return value or None
 
 
-def _guess_company_from_legal_name(text: str) -> Optional[str]:
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    candidates = []
-    for ln in lines[:120]:
-        if LEGAL_SUFFIX_RE.search(ln) and len(ln) <= 120:
-            candidates.append(ln)
-
-    for c in candidates:
-        if len(c.split()) <= 10:
-            return c
-    return candidates[0] if candidates else None
-
-
-def _extract_hr_emails(text: str) -> List[str]:
-    emails = EMAIL_RE.findall(text)
-    if not emails:
+def _clean_emails(value) -> List[str]:
+    if not value:
         return []
-
-    scored = []
-    for email in emails:
-        score = 0
-        if HR_HINT_RE.search(email):
-            score += 2
-        local = email.split("@")[0].lower()
-        if any(k in local for k in ["hr", "jobs", "career", "careers", "recruit", "talent", "bewerbung", "karriere"]):
-            score += 2
-        scored.append((score, email))
-
-    scored.sort(key=lambda x: (-x[0], x[1].lower()))
+    if isinstance(value, str):
+        parts = value.split(",")
+    elif isinstance(value, list):
+        parts = value
+    else:
+        return []
 
     seen = set()
     result = []
-    for _, email in scored:
+    for part in parts:
+        email = str(part).strip()
         key = email.lower()
-        if key not in seen:
+        if email and key not in seen:
             seen.add(key)
             result.append(email)
-
     return result[:5]
 
 
-def _extract_salary(text: str) -> Optional[str]:
-    label_val = _first_label_match(SALARY_LABEL_PATTERNS, text)
-    if label_val:
-        return label_val
-
-    matches = SALARY_RE.findall(text)
-    if matches:
-        return matches[0].strip()
-
-    return None
+def _extract_json_object(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(text[start : end + 1])
 
 
 def extract(text: str) -> Extracted:
-    ex = Extracted(hr_emails=[])
+    prompt = f"""
+Extract job application fields from the job description below.
 
-    urls = URL_RE.findall(text)
-    ex.job_url = urls[0] if urls else None
+Return only one valid JSON object with exactly these keys:
+company, role, job_url, location, salary_range, hr_emails
 
-    m_role = ROLE_MWD_RE.search(text)
-    if m_role:
-        ex.role = m_role.group(1).strip()
-    else:
-        ex.role = _first_label_match(ROLE_LABEL_PATTERNS, text)
+Rules:
+- Use null for unknown string fields.
+- hr_emails must be an array of strings.
+- Do not guess if the text does not say it.
+- Do not include markdown, comments, or extra text.
 
-    ex.company = _first_label_match(COMPANY_LABEL_PATTERNS, text)
-    if not ex.company:
-        ex.company = _guess_company_from_legal_name(text)
+Job description:
+\"\"\"{text}\"\"\"
+""".strip()
 
-    m_loc = POSTCODE_LOCATION_RE.search(text)
-    if m_loc:
-        ex.location = f"{m_loc.group(1)} {m_loc.group(2).strip()}"
-    else:
-        ex.location = _first_label_match(LOCATION_LABEL_PATTERNS, text)
-        if not ex.location:
-            m = LOCATION_HINT_RE.search(text)
-            ex.location = m.group(0) if m else None
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0},
+    }
 
-    ex.salary_range = _extract_salary(text)
-    ex.hr_emails = _extract_hr_emails(text)
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
 
-    if ex.company:
-        ex.company = re.sub(r"(?i)^(about|über)\s+", "", ex.company).strip()
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            ollama_result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        print(f"Ollama extraction failed: {exc}. Continuing with blank fields.")
+        return Extracted(hr_emails=[])
 
-    return ex
+    try:
+        data = _extract_json_object(ollama_result.get("response", ""))
+    except (TypeError, json.JSONDecodeError) as exc:
+        print(f"Ollama returned invalid JSON: {exc}. Continuing with blank fields.")
+        return Extracted(hr_emails=[])
+
+    return Extracted(
+        company=_clean_optional(data.get("company")),
+        role=_clean_optional(data.get("role")),
+        job_url=_clean_optional(data.get("job_url")),
+        location=_clean_optional(data.get("location")),
+        salary_range=_clean_optional(data.get("salary_range")),
+        hr_emails=_clean_emails(data.get("hr_emails")),
+    )
 
 
 def confirm_field(label: str, current: Optional[str], required: bool = False) -> str:
